@@ -420,10 +420,146 @@
         };
     }
 
+    function installVinobaGenerationHistoryFix() {
+        if (!/\/home\.php$/i.test(window.location.pathname)) return;
+        if (window.__vinobaGenerationHistoryFix) return;
+        if (typeof currentPlant === 'undefined' || currentPlant !== 'vinoba-velliyanai') return;
+        if (typeof powerChart === 'undefined' || !powerChart) return;
+
+        window.__vinobaGenerationHistoryFix = true;
+        chartLoadedFromApi = true;
+
+        const historyByInverter = new Map();
+        let attachedSocket = null;
+
+        function powerFromValues(values) {
+            if (!values || typeof values !== 'object' || Array.isArray(values)) return 0;
+            for (const key in values) {
+                const lower = key.toLowerCase();
+                if (/active.*power|ac.*power|power.*ac|a\.c\..*power/.test(lower) && !/reactive|apparent|3.phase/.test(lower)) {
+                    return Number(values[key]) || 0;
+                }
+            }
+            return 0;
+        }
+
+        function readingMinutes(reading) {
+            const raw = String(reading.timestamp || reading.time || reading.recorded_at || reading.datetime || reading.date || '');
+            const direct = raw.match(/(?:T|\s|^)(\d{1,2}):(\d{2})/);
+            if (direct) return Number(direct[1]) * 60 + Number(direct[2]);
+            const parsed = new Date(raw);
+            if (isNaN(parsed.getTime())) return null;
+            return parsed.getHours() * 60 + parsed.getMinutes();
+        }
+
+        function slotLabel(minutes) {
+            if (minutes === null || minutes < 300 || minutes > 1170) return '';
+            const bucket = Math.floor(minutes / 15) * 15;
+            return String(Math.floor(bucket / 60)).padStart(2, '0') + ':' + String(bucket % 60).padStart(2, '0');
+        }
+
+        function renderVinobaHistory() {
+            if (!historyByInverter.size || typeof powerChart === 'undefined' || !powerChart) return;
+
+            const labels = [];
+            for (let minutes = 300; minutes <= 1170; minutes += 15) {
+                labels.push(String(Math.floor(minutes / 60)).padStart(2, '0') + ':' + String(minutes % 60).padStart(2, '0'));
+            }
+
+            const now = new Date();
+            const nowMinutes = now.getHours() * 60 + now.getMinutes();
+            const values = labels.map(label => {
+                const parts = label.split(':');
+                const minutes = Number(parts[0]) * 60 + Number(parts[1]);
+                if (minutes > nowMinutes) return null;
+
+                let total = 0;
+                let hasStoredValue = false;
+                historyByInverter.forEach(slots => {
+                    if (Object.prototype.hasOwnProperty.call(slots, label)) {
+                        total += Number(slots[label].value) || 0;
+                        hasStoredValue = true;
+                    }
+                });
+                return hasStoredValue ? total : 0;
+            });
+
+            if (nowMinutes >= 300 && nowMinutes <= 1170 && typeof getTotalPower === 'function') {
+                const currentSlot = slotLabel(nowMinutes);
+                const currentIndex = labels.indexOf(currentSlot);
+                if (currentIndex >= 0) values[currentIndex] = getTotalPower();
+            }
+
+            powerChart.data.labels = labels;
+            powerChart.data.datasets[0].label = 'Combined Inverters (kW)';
+            powerChart.data.datasets[0].data = values;
+            chartHasData = true;
+            lastChartPush = Date.now();
+            powerChart.update('none');
+        }
+
+        function handleSocketMessage(event) {
+            let message;
+            try { message = JSON.parse(event.data); } catch (e) { return; }
+            if (!message || (message.unit_id && message.unit_id !== currentPlant)) return;
+
+            if (message.type === 'daily_data_result') {
+                const readings = message.data || message.records || message.results || message.values || [];
+                if (!Array.isArray(readings) || !readings.length) return;
+
+                const sample = readings[0] || {};
+                const sampleValues = sample.values || sample.data || sample;
+                const keys = sampleValues && typeof sampleValues === 'object' ? Object.keys(sampleValues) : [];
+                const deviceName = String(sample.device || sample.device_name || message.device || message.task || '').trim();
+                const lowerDevice = deviceName.toLowerCase();
+                const looksLikeVcb = lowerDevice.includes('vcb') || keys.some(key => /3.*phase.*active.*power|active total export|phase-n voltage|v12/i.test(key));
+                const looksLikeInverter = !looksLikeVcb && (lowerDevice.includes('inv') || keys.some(key => {
+                    const lower = key.toLowerCase();
+                    return /active.*power|ac.*power|power.*ac|a\.c\..*power/.test(lower) && !/reactive|apparent|3.phase/.test(lower);
+                }));
+                if (!looksLikeInverter) return;
+
+                const inverterKey = deviceName || ('Inverter-' + (historyByInverter.size + 1));
+                const slots = {};
+                readings.forEach(reading => {
+                    const minutes = readingMinutes(reading);
+                    const label = slotLabel(minutes);
+                    if (!label) return;
+                    const values = reading.values || reading.data || reading;
+                    const power = powerFromValues(values);
+                    if (!Object.prototype.hasOwnProperty.call(slots, label) || minutes >= slots[label].minutes) {
+                        slots[label] = { value: power, minutes };
+                    }
+                });
+
+                if (Object.keys(slots).length) {
+                    historyByInverter.set(inverterKey, slots);
+                    renderVinobaHistory();
+                }
+                return;
+            }
+
+            if (historyByInverter.size && message.unit_id === currentPlant) {
+                setTimeout(renderVinobaHistory, 0);
+            }
+        }
+
+        function attachToSocket() {
+            if (typeof wsRef === 'undefined' || !wsRef || wsRef === attachedSocket) return;
+            attachedSocket = wsRef;
+            attachedSocket.addEventListener('message', handleSocketMessage);
+        }
+
+        attachToSocket();
+        setInterval(attachToSocket, 1000);
+    }
+
     installMonthlyReportsFix();
+    installVinobaGenerationHistoryFix();
     document.addEventListener('DOMContentLoaded', function () {
         initializeSidebar();
         installMonthlyReportsFix();
+        installVinobaGenerationHistoryFix();
     });
     const observer = new MutationObserver(initializeSidebar);
     observer.observe(document.documentElement, { childList: true, subtree: true });
