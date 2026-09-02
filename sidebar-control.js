@@ -82,7 +82,93 @@
         applyLayout();
     }
 
-    document.addEventListener('DOMContentLoaded', initializeSidebar);
+    function installMonthlyReportsFix() {
+        if (!/\/reports\.php$/i.test(window.location.pathname)) return;
+        if (window.__monthlyReportsHistoricalFix) return;
+        if (typeof window.generateReportData !== 'function') return;
+
+        window.__monthlyReportsHistoricalFix = true;
+        const originalGenerateReportData = window.generateReportData;
+
+        window.generateReportData = function () {
+            const typeEl = document.getElementById('reportType');
+            if (!typeEl || typeEl.value !== 'monthly') {
+                return originalGenerateReportData();
+            }
+
+            const monthEl = document.getElementById('monthSelect');
+            const plantEl = document.getElementById('plantSelect');
+            const tbody = document.getElementById('reportTableBody');
+            const displayDate = document.getElementById('displayDate');
+            const selectedMonth = monthEl ? monthEl.value : '';
+            const plant = plantEl ? plantEl.value : '';
+
+            if (!selectedMonth || !plant) return originalGenerateReportData();
+
+            const monthDate = new Date(selectedMonth + '-01T00:00:00');
+            if (displayDate && !isNaN(monthDate.getTime())) {
+                displayDate.innerText = monthDate.toLocaleDateString('en-IN', { year: 'numeric', month: 'long' });
+            }
+            if (tbody) {
+                tbody.innerHTML = '<tr><td colspan="30" class="py-12 bg-white"><div class="flex flex-col items-center justify-center"><div class="w-10 h-10 border-4 border-gray-200 border-t-blue-600 rounded-full animate-spin"></div><p class="mt-3 text-sm font-bold text-gray-600">Fetching monthly historical report...</p></div></td></tr>';
+            }
+
+            // The report WebSocket subscribes to real plant IDs. Keep the existing
+            // DB aggregation for the synthetic admin "all" selection.
+            if (plant === 'all') {
+                pendingReportRequest = false;
+                if (wsReportTimeout) { clearTimeout(wsReportTimeout); wsReportTimeout = null; }
+                fetchReportFromAPI().catch(err => {
+                    if (tbody) tbody.innerHTML = '<tr><td colspan="30" class="py-10 text-center"><div class="text-red-500 font-bold mb-1">Data Error</div><div class="text-gray-400 text-xs">' + err.message + '</div></td></tr>';
+                    console.error(err);
+                });
+                return;
+            }
+
+            pendingReportRequest = true;
+            if (wsReportTimeout) { clearTimeout(wsReportTimeout); wsReportTimeout = null; }
+            connectReportWS();
+
+            function sendMonthlyReport(dateValue) {
+                if (!ws || ws.readyState !== WebSocket.OPEN || !pendingReportRequest) return false;
+                ws.send(JSON.stringify({ type: 'subscribe', unit_id: plant }));
+                ws.send(JSON.stringify({
+                    type: 'generate_report',
+                    unit_id: plant,
+                    pageName: 'inverter&vcb-monthly',
+                    date: dateValue
+                }));
+                console.log('WS: requested monthly historical report for', plant, dateValue);
+                return true;
+            }
+
+            if (!sendMonthlyReport(selectedMonth)) {
+                setTimeout(() => sendMonthlyReport(selectedMonth), 1500);
+            }
+
+            // Some report-server builds expect a full date even for a monthly page.
+            // Retry with the first day before using the DB fallback.
+            setTimeout(() => {
+                if (pendingReportRequest) sendMonthlyReport(selectedMonth + '-01');
+            }, 5000);
+
+            wsReportTimeout = setTimeout(() => {
+                if (!pendingReportRequest) return;
+                console.log('Monthly WS report timeout, falling back to DB aggregate');
+                pendingReportRequest = false;
+                fetchReportFromAPI().catch(err => {
+                    if (tbody) tbody.innerHTML = '<tr><td colspan="30" class="py-10 text-center"><div class="text-red-500 font-bold mb-1">Data Error</div><div class="text-gray-400 text-xs">' + err.message + '</div></td></tr>';
+                    console.error(err);
+                });
+            }, 15000);
+        };
+    }
+
+    installMonthlyReportsFix();
+    document.addEventListener('DOMContentLoaded', function () {
+        initializeSidebar();
+        installMonthlyReportsFix();
+    });
     const observer = new MutationObserver(initializeSidebar);
     observer.observe(document.documentElement, { childList: true, subtree: true });
 })();
