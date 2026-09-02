@@ -296,9 +296,9 @@ $l = $live['latest'] ?? [];
 $timeBuckets = buildBuckets($type, $date, $chartMode);
 
 $isToday = ($date === date('Y-m-d'));
-// Historical readings always populate their own time buckets. Live readings are
-// added only to the current bucket below, never copied into future/past rows.
-{
+// Daily historical readings populate their time buckets. Monthly reports use the
+// dedicated monthly aggregation block below and must never compare DATE() to YYYY-MM.
+if ($type === 'daily') {
     $q = "SELECT DATE_FORMAT(recorded_at,'%H:%i') as bTime, daily_generation as kwh, ac_active_power as kw, internal_temp as temp FROM inverter_readings WHERE DATE(recorded_at)='$date' AND device_name = '$inv1Name' $plantClause ORDER BY recorded_at ASC";
     $res = $conn->query($q);
     $bucketFn = $chartMode ? 'toHour' : 'to15min';
