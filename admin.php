@@ -141,12 +141,51 @@ if (!$adminUser || $adminUser['role'] !== 'admin') {
 
         const plantState = {};
         const authToken = new URLSearchParams(window.location.search).get('token') || '';
+
+        function localDateKey() {
+            const now = new Date();
+            return now.getFullYear() + '-' +
+                String(now.getMonth() + 1).padStart(2, '0') + '-' +
+                String(now.getDate()).padStart(2, '0');
+        }
+
+        function todayCacheKey(unit) {
+            return 'admin_today_' + localDateKey() + '_' + unit;
+        }
+
+        function loadCachedToday(unit) {
+            const cached = parseFloat(localStorage.getItem(todayCacheKey(unit)) || '0');
+            return Number.isFinite(cached) && cached > 0 ? cached : 0;
+        }
+
+        function ensureEnergyDate(unit) {
+            const st = plantState[unit];
+            if (!st) return;
+            const today = localDateKey();
+            if (st.energyDate !== today) {
+                st.energyDate = today;
+                st.dailyEnergy = 0;
+                Object.values(st.inverters || {}).forEach(inverter => { inverter.dailyGen = 0; });
+            }
+        }
+
+        function updateDailyEnergy(unit) {
+            const st = plantState[unit];
+            if (!st) return;
+            const inverterTotal = Object.values(st.inverters || {})
+                .reduce((sum, inverter) => sum + (Number(inverter.dailyGen) || 0), 0);
+            const bestToday = Math.max(inverterTotal, loadCachedToday(unit), Number(st.dailyEnergy) || 0);
+            st.dailyEnergy = bestToday;
+            if (bestToday > 0) localStorage.setItem(todayCacheKey(unit), String(bestToday));
+        }
+
         plants.forEach(p => {
             plantState[p.id] = {
                 vcbPower: 0,
                 hasVCB: false,
                 vcbToday: 0,
-                dailyEnergy: 0,
+                energyDate: localDateKey(),
+                dailyEnergy: loadCachedToday(p.id),
                 inverters: {},
                 peakInverterKw: 0,
                 peakHour: '--:--',
@@ -363,6 +402,18 @@ if (!$adminUser || $adminUser['role'] !== 'admin') {
             return 0;
         }
 
+        function extractDailyGeneration(values) {
+            if (!values || typeof values !== 'object') return 0;
+            for (const key in values) {
+                const lower = key.toLowerCase();
+                if (/daily.*generation|daily.*gen|today.*generation|today.*gen/.test(lower)) {
+                    const value = Number(values[key]);
+                    return Number.isFinite(value) ? value : 0;
+                }
+            }
+            return 0;
+        }
+
         function loadInverterPeakHistory(unit, data, requestedDevice = '') {
             const st = plantState[unit];
             const readings = data.data || data.records || data.results || data.values || [];
@@ -372,9 +423,12 @@ if (!$adminUser || $adminUser['role'] !== 'admin') {
             if (!deviceName) return;
 
             const commonTimePower = {};
+            let historyDailyGen = Number(st.inverters[deviceName]?.dailyGen) || 0;
             readings.forEach(reading => {
                 const values = reading.values || reading.data || reading;
                 const power = extractInverterPower(values);
+                const dailyGen = extractDailyGeneration(values);
+                if (dailyGen > historyDailyGen) historyDailyGen = dailyGen;
                 const rawTime = String(reading.timestamp || reading.time || reading.recorded_at || reading.datetime || '');
                 const directTime = rawTime.match(/(?:T|\s|^)(\d{1,2}):(\d{2})/);
                 const parsedTime = new Date(rawTime);
@@ -395,6 +449,14 @@ if (!$adminUser || $adminUser['role'] !== 'admin') {
                 }
             });
             st.hourlyPowerByInverter[deviceName] = commonTimePower;
+
+            if (!st.inverters[deviceName]) {
+                st.inverters[deviceName] = { active: 0, total: 0, power: 0, dailyGen: 0 };
+            }
+            if (historyDailyGen > (Number(st.inverters[deviceName].dailyGen) || 0)) {
+                st.inverters[deviceName].dailyGen = historyDailyGen;
+            }
+            updateDailyEnergy(unit);
 
             const inverterSeries = Object.values(st.hourlyPowerByInverter);
             let historicalPeakKw = 0;
@@ -446,6 +508,7 @@ if (!$adminUser || $adminUser['role'] !== 'admin') {
                     const data = JSON.parse(event.data);
                     const unit = data.unit_id;
                     if(!plantState[unit]) return;
+                    ensureEnergyDate(unit);
 
                     if (data.type === 'daily_data_result') {
                         const queuedDevice = pendingPeakHistory[unit] && pendingPeakHistory[unit].length
@@ -502,9 +565,7 @@ if (!$adminUser || $adminUser['role'] !== 'admin') {
                                     type: 'get_daily_data',
                                     unit_id: unit,
                                     device: deviceName,
-                                    date: new Date().getFullYear() + '-' +
-                                        String(new Date().getMonth() + 1).padStart(2, '0') + '-' +
-                                        String(new Date().getDate()).padStart(2, '0')
+                                    date: localDateKey()
                                 }));
                             }
                             let pwr = 0;
@@ -516,24 +577,15 @@ if (!$adminUser || $adminUser['role'] !== 'admin') {
                             }
                             const previousInv = plantState[unit].inverters[deviceName] || {};
                             let dailyGen = Number(previousInv.dailyGen) || 0;
-                            for (const key in data.values) {
-                                const lower = key.toLowerCase();
-                                if (/daily.*generation|daily.*gen|today.*generation|today.*gen/.test(lower)) {
-                                    const incomingDailyGen = parseFloat(data.values[key]);
-                                    if (Number.isFinite(incomingDailyGen) && (incomingDailyGen > 0 || dailyGen <= 0)) {
-                                        dailyGen = incomingDailyGen;
-                                    }
-                                    break;
-                                }
-                            }
+                            const incomingDailyGen = extractDailyGeneration(data.values);
+                            if (incomingDailyGen > dailyGen) dailyGen = incomingDailyGen;
                             plantState[unit].inverters[deviceName] = {
                                 active: activeStrCount,
                                 total: totalStrCount,
                                 power: pwr,
                                 dailyGen: dailyGen
                             };
-                            plantState[unit].dailyEnergy = Object.values(plantState[unit].inverters)
-                                .reduce((sum, inverter) => sum + (Number(inverter.dailyGen) || 0), 0);
+                            updateDailyEnergy(unit);
                             const liveCombinedPower = Object.values(plantState[unit].inverters)
                                 .reduce((sum, inverter) => sum + (inverter.power || 0), 0);
                             plantState[unit].liveCombinedKw = liveCombinedPower;
