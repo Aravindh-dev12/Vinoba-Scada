@@ -131,7 +131,7 @@ function fetchLiveData($plant) {
     }
 
     $latest = ['inv1'=>[],'inv2'=>[],'vcb'=>[],'trafo'=>[]];
-    $invRaw = []; // key = actual device name, value = parsed data
+    $invRaw = [];
     foreach ($frames as $f) {
         $task = strtolower($f['task'] ?? '');
         $dev = strtolower($f['device'] ?? '');
@@ -163,7 +163,6 @@ function fetchLiveData($plant) {
             }
         }
     }
-    // Sort inverter device names alphabetically and map to inv1/inv2 by order
     $invNames = array_keys($invRaw);
     sort($invNames);
     if (isset($invNames[0]) && isset($invRaw[$invNames[0]])) $latest['inv1'] = $invRaw[$invNames[0]];
@@ -273,7 +272,9 @@ function toHour($t) { $p=explode(':',$t); return $p[0].':00'; }
 $live = ['success' => false, 'latest' => [], 'frames' => 0, 'error' => null, 'inv_names' => []];
 $hasLive = false;
 
-if ($plant !== 'all' && $plant !== '') {
+// Monthly reports are historical DB aggregates; do not block them on a live WS fetch.
+// Daily behavior remains unchanged.
+if ($type !== 'monthly' && $plant !== 'all' && $plant !== '') {
     $live = fetchLiveData($plant);
     $hasLive = (isset($live['success']) && !empty($live['latest']['inv1']));
     if ($hasLive) {
@@ -344,20 +345,85 @@ if (!$chartMode && $hasLive && $isToday) {
 }
 
 if ($type === 'monthly') {
+    $monthStart = date('Y-m-01', strtotime($date . '-01'));
+    $nextMonthStart = date('Y-m-01', strtotime($monthStart . ' +1 month'));
+
+    // Build monthly inverter rows from every inverter found in the selected plant(s).
+    // Daily generation is a cumulative daily counter, so MAX per plant/device/day is
+    // the correct daily value. When "All Plants" is selected, values with the same
+    // device name are summed across plants.
+    $monthlyInvNames = [];
+    $monthlyInvData = [];
+    $monthlyInvQuery = "SELECT DATE(recorded_at) report_day, plant_id, device_name, " .
+        "MAX(daily_generation) kwh, MAX(ac_active_power) kw " .
+        "FROM inverter_readings WHERE recorded_at >= '$monthStart 00:00:00' " .
+        "AND recorded_at < '$nextMonthStart 00:00:00' $plantClause " .
+        "AND device_name NOT LIKE 'VCB%' AND device_name NOT LIKE 'Transformer%' " .
+        "GROUP BY DATE(recorded_at), plant_id, device_name " .
+        "ORDER BY device_name ASC, report_day ASC";
+    $monthlyInvRes = $conn->query($monthlyInvQuery);
+    if ($monthlyInvRes) {
+        while ($row = $monthlyInvRes->fetch_assoc()) {
+            $dev = $row['device_name'];
+            $day = $row['report_day'];
+            if (!in_array($dev, $monthlyInvNames, true)) $monthlyInvNames[] = $dev;
+            if (!isset($monthlyInvData[$day])) $monthlyInvData[$day] = [];
+            if (!isset($monthlyInvData[$day][$dev])) $monthlyInvData[$day][$dev] = ['kwh' => 0, 'kw' => 0];
+            $monthlyInvData[$day][$dev]['kwh'] += (float)$row['kwh'];
+            $monthlyInvData[$day][$dev]['kw'] += (float)$row['kw'];
+        }
+    }
+    if (!empty($monthlyInvNames)) {
+        natcasesort($monthlyInvNames);
+        $invNames = array_values($monthlyInvNames);
+    }
+
+    // Prefer the bridge's vcb-today field when that column exists. Fall back to
+    // cumulative export max-min for older schemas/data.
+    $hasTodayEnergy = false;
+    $todayColRes = $conn->query("SHOW COLUMNS FROM vcb_readings LIKE 'today_energy'");
+    if ($todayColRes && $todayColRes->num_rows > 0) $hasTodayEnergy = true;
+
+    $monthlyVcbToday = [];
+    if ($hasTodayEnergy) {
+        $vcbTodayRes = $conn->query("SELECT report_day, SUM(kwh) kwh FROM (" .
+            "SELECT DATE(recorded_at) report_day, plant_id, MAX(today_energy) kwh " .
+            "FROM vcb_readings WHERE recorded_at >= '$monthStart 00:00:00' " .
+            "AND recorded_at < '$nextMonthStart 00:00:00' $plantClause " .
+            "GROUP BY DATE(recorded_at), plant_id" .
+            ") daily_vcb GROUP BY report_day");
+        if ($vcbTodayRes) while ($row = $vcbTodayRes->fetch_assoc()) {
+            $monthlyVcbToday[$row['report_day']] = (float)$row['kwh'];
+        }
+    }
+
+    $monthlyVcbExport = [];
+    $vcbExportRes = $conn->query("SELECT report_day, SUM(kwh_exp) kwh_exp FROM (" .
+        "SELECT DATE(recorded_at) report_day, plant_id, " .
+        "GREATEST(MAX(active_total_export)-MIN(active_total_export),0) kwh_exp " .
+        "FROM vcb_readings WHERE recorded_at >= '$monthStart 00:00:00' " .
+        "AND recorded_at < '$nextMonthStart 00:00:00' $plantClause " .
+        "GROUP BY DATE(recorded_at), plant_id" .
+        ") daily_vcb GROUP BY report_day");
+    if ($vcbExportRes) while ($row = $vcbExportRes->fetch_assoc()) {
+        $monthlyVcbExport[$row['report_day']] = ((float)$row['kwh_exp']) / 1000;
+    }
+
     $days = date('t', strtotime($date.'-01'));
     for ($i=1; $i<=$days; $i++) {
         $d = date('Y-m',strtotime($date.'-01')).'-'.str_pad($i,2,'0',STR_PAD_LEFT);
         $label = str_pad($i,2,'0',STR_PAD_LEFT).'-'.date('m-Y',strtotime($date.'-01'));
-        // Sum each plant's/device's daily maximum. A plain MAX would silently
-        // return only one plant when the admin selects All Plants.
-        $r1=$conn->query("SELECT COALESCE(SUM(kwh),0) as kwh, COALESCE(SUM(kw),0) as kw FROM (SELECT plant_id, device_name, MAX(daily_generation) kwh, MAX(ac_active_power) kw FROM inverter_readings WHERE DATE(recorded_at)='$d' AND device_name = '$inv1Name' $plantClause GROUP BY plant_id, device_name) daily_inv");
-        if ($r1&&$r1->num_rows>0){$row=$r1->fetch_assoc(); $timeBuckets[$label]['inv1_kwh']=(float)$row['kwh']; $timeBuckets[$label]['inv1_kw']=(float)$row['kw'];}
-        $r2=$conn->query("SELECT COALESCE(SUM(kwh),0) as kwh, COALESCE(SUM(kw),0) as kw FROM (SELECT plant_id, device_name, MAX(daily_generation) kwh, MAX(ac_active_power) kw FROM inverter_readings WHERE DATE(recorded_at)='$d' AND device_name = '$inv2Name' $plantClause GROUP BY plant_id, device_name) daily_inv");
-        if ($r2&&$r2->num_rows>0){$row=$r2->fetch_assoc(); $timeBuckets[$label]['inv2_kwh']=(float)$row['kwh']; $timeBuckets[$label]['inv2_kw']=(float)$row['kw'];}
-        // The VCB export register is cumulative, so daily energy is max-min.
-        // Calculate that independently per plant before combining all plants.
-        $rv=$conn->query("SELECT COALESCE(SUM(kwh_exp),0) as kwh_exp FROM (SELECT plant_id, GREATEST(MAX(active_total_export)-MIN(active_total_export),0) kwh_exp FROM vcb_readings WHERE DATE(recorded_at)='$d' $plantClause GROUP BY plant_id) daily_vcb");
-        if ($rv&&$rv->num_rows>0){$row=$rv->fetch_assoc(); $timeBuckets[$label]['vcb_kwh']=((float)$row['kwh_exp'])/1000;}
+
+        foreach ($invNames as $idx => $dev) {
+            $n = $idx + 1;
+            $daily = $monthlyInvData[$d][$dev] ?? ['kwh' => 0, 'kw' => 0];
+            $timeBuckets[$label]['inv'.$n.'_kwh'] = (float)$daily['kwh'];
+            $timeBuckets[$label]['inv'.$n.'_kw'] = (float)$daily['kw'];
+        }
+
+        $vcbToday = $monthlyVcbToday[$d] ?? 0;
+        $timeBuckets[$label]['vcb_kwh'] = $vcbToday > 0 ? $vcbToday : ($monthlyVcbExport[$d] ?? 0);
+
         $rt=$conn->query("SELECT oil_temp, winding_temp FROM transformer_readings WHERE DATE(recorded_at)='$d' $plantClause ORDER BY recorded_at DESC LIMIT 1");
         if ($rt&&$rt->num_rows>0){$row=$rt->fetch_assoc(); if($row['oil_temp']!==null)$timeBuckets[$label]['ot']=(float)$row['oil_temp']; if($row['winding_temp']!==null)$timeBuckets[$label]['wt1']=(float)$row['winding_temp'];}
     }
