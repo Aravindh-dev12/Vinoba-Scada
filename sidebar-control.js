@@ -18,8 +18,6 @@
         const footerText = sidebar.querySelector('.sidebar-footer-text');
         const sidebarHeader = sidebar.firstElementChild;
 
-        // Keep the same top-right control position even if older sidebar markup
-        // remains in the browser cache.
         if (toggle && sidebarHeader) {
             sidebarHeader.appendChild(toggle);
             toggle.className = 'hidden md:flex absolute top-3 w-7 h-7 items-center justify-center rounded-full bg-white border border-slate-200 shadow-md text-slate-500 hover:bg-emerald-100 hover:text-emerald-700 transition z-50';
@@ -65,9 +63,7 @@
                     linkIcon.style.margin = '0';
                 }
             });
-            if (icon) icon.className = collapsed
-                ? 'fa-solid fa-angles-right'
-                : 'fa-solid fa-angles-left';
+            if (icon) icon.className = collapsed ? 'fa-solid fa-angles-right' : 'fa-solid fa-angles-left';
             if (toggle) toggle.title = collapsed ? 'Expand sidebar' : 'Collapse sidebar';
         }
 
@@ -84,36 +80,85 @@
 
     function installMonthlyReportsFix() {
         if (!/\/reports\.php$/i.test(window.location.pathname)) return;
-        if (window.__monthlyReportsHistoricalFix) return;
-        if (typeof window.generateReportData !== 'function' ||
-            typeof window.handleWSReportResponse !== 'function') return;
+        if (window.__monthlyReportsHistoricalFixV2) return;
+        if (typeof window.generateReportData !== 'function' || typeof window.handleWSReportResponse !== 'function') return;
 
-        window.__monthlyReportsHistoricalFix = true;
+        window.__monthlyReportsHistoricalFixV2 = true;
 
         const originalGenerateReportData = window.generateReportData;
         const originalHandleWSReportResponse = window.handleWSReportResponse;
         let monthlyRun = null;
 
-        function cancelMonthlyRun() {
-            if (!monthlyRun) return;
-            monthlyRun.cancelled = true;
-            if (monthlyRun.timer) clearTimeout(monthlyRun.timer);
-            monthlyRun = null;
-            pendingReportRequest = false;
-        }
-
         function numberValue(value) {
             if (value === undefined || value === null || value === '') return 0;
-            const n = Number(String(value).replace(/,/g, '').trim());
+            if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+            if (typeof value === 'object') {
+                const candidates = ['value', 'rawValue', 'displayValue', 'text', 'formattedValue'];
+                for (const key of candidates) {
+                    if (Object.prototype.hasOwnProperty.call(value, key)) {
+                        const parsed = numberValue(value[key]);
+                        if (parsed !== 0) return parsed;
+                    }
+                }
+                return 0;
+            }
+            const cleaned = String(value).replace(/,/g, '').trim();
+            const match = cleaned.match(/[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?/);
+            if (!match) return 0;
+            const n = parseFloat(match[0]);
             return Number.isFinite(n) ? n : 0;
         }
 
-        function maxCell(rows, index) {
+        function reportPayload(message) {
+            if (!message || typeof message !== 'object') return { columns: [], rows: [] };
+            if (Array.isArray(message.columns) || Array.isArray(message.rows)) {
+                return {
+                    columns: Array.isArray(message.columns) ? message.columns : [],
+                    rows: Array.isArray(message.rows) ? message.rows : []
+                };
+            }
+            const nested = message.reportData;
+            if (nested && typeof nested === 'object') {
+                return {
+                    columns: Array.isArray(nested.columns) ? nested.columns : [],
+                    rows: Array.isArray(nested.rows) ? nested.rows : []
+                };
+            }
+            return { columns: [], rows: [] };
+        }
+
+        function columnName(col) {
+            if (!col || typeof col !== 'object') return '';
+            return String(col.name || col.title || col.label || col.header || col.field || '').trim();
+        }
+
+        function cellAt(row, index) {
+            if (!row || index < 0) return 0;
+            if (Array.isArray(row.cells)) return numberValue(row.cells[index]);
+            if (Array.isArray(row.values)) return numberValue(row.values[index]);
+            return 0;
+        }
+
+        function maxColumn(rows, index) {
             if (index < 0) return 0;
             let max = 0;
+            rows.forEach(row => { max = Math.max(max, cellAt(row, index)); });
+            return max;
+        }
+
+        function maxColumns(rows, indices) {
+            let max = 0;
+            indices.forEach(index => { max = Math.max(max, maxColumn(rows, index)); });
+            return max;
+        }
+
+        function maxRowKeys(rows, pattern) {
+            let max = 0;
             rows.forEach(row => {
-                const cells = row && Array.isArray(row.cells) ? row.cells : [];
-                max = Math.max(max, numberValue(cells[index]));
+                if (!row || typeof row !== 'object') return;
+                Object.keys(row).forEach(key => {
+                    if (pattern.test(key)) max = Math.max(max, numberValue(row[key]));
+                });
             });
             return max;
         }
@@ -124,118 +169,110 @@
 
         function formatMonthDate(dateValue) {
             const parts = String(dateValue).split('-');
-            if (parts.length !== 3) return dateValue;
-            return parts[2] + '-' + parts[1] + '-' + parts[0];
+            return parts.length === 3 ? parts[2] + '-' + parts[1] + '-' + parts[0] : dateValue;
         }
 
-        function parseDailyWSReport(d, dateValue) {
-            const columns = Array.isArray(d.columns) ? d.columns : [];
-            const rows = Array.isArray(d.rows) ? d.rows : [];
+        function parseDailyReport(message, dateValue) {
+            const payload = reportPayload(message);
+            const columns = payload.columns;
+            const rows = payload.rows;
             if (!columns.length || !rows.length) return null;
 
             const inverterCols = [];
+            const vcbCols = [];
+            const lossCols = [];
+            let totalIdx = -1;
+
             columns.forEach((col, index) => {
-                const name = String((col && col.name) || '').trim();
-                if (/^INV-\d+/i.test(name) && !(col && col.isHidden)) {
+                const name = columnName(col);
+                if (!name) return;
+
+                if (/^\s*(?:inv|inverter)[\s_.-]*\d+/i.test(name) && !/total/i.test(name)) {
                     inverterCols.push({ name, index });
                 }
+                if (/inverter\s*total|inv\s*total|total\s*inverter/i.test(name)) totalIdx = index;
+                if (/\bvcb\b|ht[\s_.-]*(?:panel|pannel)|ht[\s_.-]*mfm|ht[\s_.-]*meter/i.test(name)) vcbCols.push(index);
+                if (/transformer\s*loss|tx\s*loss|\bloss\b/i.test(name)) lossCols.push(index);
             });
-            if (!inverterCols.length) return null;
 
-            const totalIdx = columns.findIndex(col => /inverter.*total/i.test(String((col && col.name) || '')));
-            const vcbIdx = columns.findIndex(col =>
-                /(ht[\s._-]*(panel|pannel)|vcb)/i.test(String((col && col.name) || '')) &&
-                !(col && col.isHidden)
-            );
+            if (!inverterCols.length) return null;
+            inverterCols.sort((a, b) => naturalCompare(a.name, b.name));
 
             const inverters = {};
-            inverterCols.forEach(col => {
-                inverters[col.name] = maxCell(rows, col.index);
-            });
-
+            inverterCols.forEach(col => { inverters[col.name] = maxColumn(rows, col.index); });
             const inverterSum = Object.values(inverters).reduce((sum, value) => sum + value, 0);
-            const reportedTotal = maxCell(rows, totalIdx);
+            const reportedTotal = maxColumn(rows, totalIdx);
             const invTotal = reportedTotal > 0 ? reportedTotal : inverterSum;
-            const vcb = maxCell(rows, vcbIdx);
 
-            return {
-                date: dateValue,
-                inverters,
-                invTotal,
-                vcb,
-                txLoss: invTotal - vcb
-            };
+            let vcb = maxColumns(rows, vcbCols);
+            if (vcb <= 0) {
+                vcb = maxRowKeys(rows, /vcb|ht[_\s.-]*(?:panel|pannel|mfm|meter)/i);
+            }
+
+            let txLoss = maxColumns(rows, lossCols);
+            if (txLoss <= 0) txLoss = maxRowKeys(rows, /transformer[_\s.-]*loss|tx[_\s.-]*loss/i);
+
+            if (vcb <= 0 && invTotal > 0 && txLoss > 0 && invTotal >= txLoss) {
+                vcb = invTotal - txLoss;
+            }
+            if (txLoss <= 0 && invTotal > 0 && vcb > 0) {
+                txLoss = invTotal - vcb;
+            }
+
+            return { date: dateValue, inverters, invTotal, vcb, txLoss };
         }
 
         async function fetchDailyAPIFallback(run, dateValue) {
             try {
-                const authToken = new URLSearchParams(window.location.search).get('token') ||
-                    sessionStorage.getItem('vs_token') || '';
-                const url = 'api_reports.php?tab=inv_vcb&type=daily&date=' +
-                    encodeURIComponent(dateValue) + '&plant=' +
-                    encodeURIComponent(run.plant) + '&token=' +
-                    encodeURIComponent(authToken);
-                const res = await fetch(url, {
-                    headers: authToken ? { 'Authorization': 'Bearer ' + authToken } : {}
-                });
+                const authToken = new URLSearchParams(window.location.search).get('token') || sessionStorage.getItem('vs_token') || '';
+                const url = 'api_reports.php?tab=inv_vcb&type=daily&date=' + encodeURIComponent(dateValue) +
+                    '&plant=' + encodeURIComponent(run.plant) + '&token=' + encodeURIComponent(authToken);
+                const res = await fetch(url, { headers: authToken ? { 'Authorization': 'Bearer ' + authToken } : {} });
                 const result = await res.json();
                 if (!result || !result.success || !Array.isArray(result.data)) return null;
 
-                const names = result.meta && Array.isArray(result.meta.inv_names)
-                    ? result.meta.inv_names : [];
+                const names = result.meta && Array.isArray(result.meta.inv_names) ? result.meta.inv_names : [];
                 const inverters = {};
                 names.forEach((name, idx) => {
                     let max = 0;
-                    result.data.forEach(row => {
-                        max = Math.max(max, numberValue(row['inv' + (idx + 1) + '_kwh']));
-                    });
+                    result.data.forEach(row => { max = Math.max(max, numberValue(row['inv' + (idx + 1) + '_kwh'])); });
                     inverters[name] = max;
                 });
 
                 let vcb = 0;
-                result.data.forEach(row => {
-                    vcb = Math.max(vcb, numberValue(row.vcb_kwh));
-                });
-
+                result.data.forEach(row => { vcb = Math.max(vcb, numberValue(row.vcb_kwh)); });
                 const invTotal = Object.values(inverters).reduce((sum, value) => sum + value, 0);
                 if (!names.length && invTotal === 0 && vcb === 0) return null;
-
-                return {
-                    date: dateValue,
-                    inverters,
-                    invTotal,
-                    vcb,
-                    txLoss: invTotal - vcb
-                };
+                return { date: dateValue, inverters, invTotal, vcb, txLoss: invTotal - vcb };
             } catch (err) {
                 console.warn('Monthly daily API fallback failed for', dateValue, err);
                 return null;
             }
         }
 
-        function storeMonthlyDay(run, dayData) {
+        function cancelMonthlyRun() {
+            if (!monthlyRun) return;
+            monthlyRun.cancelled = true;
+            if (monthlyRun.timer) clearTimeout(monthlyRun.timer);
+            monthlyRun = null;
+            pendingReportRequest = false;
+        }
+
+        function storeDay(run, dayData) {
             if (!dayData) return;
             run.days[dayData.date] = dayData;
             Object.keys(dayData.inverters || {}).forEach(name => run.invNames.add(name));
             run.successfulDays++;
         }
 
-        function renderMonthlyRun(run) {
+        function renderMonthly(run) {
             if (!run || run.cancelled || monthlyRun !== run) return;
-
             const invNames = Array.from(run.invNames).sort(naturalCompare);
+
             if (!run.successfulDays || !invNames.length) {
                 monthlyRun = null;
                 pendingReportRequest = false;
-                fetchReportFromAPI().catch(err => {
-                    const tbody = document.getElementById('reportTableBody');
-                    if (tbody) {
-                        tbody.innerHTML = '<tr><td colspan="30" class="py-10 text-center">' +
-                            '<div class="text-red-500 font-bold mb-1">Data Error</div>' +
-                            '<div class="text-gray-400 text-xs">' + err.message + '</div></td></tr>';
-                    }
-                    console.error(err);
-                });
+                fetchReportFromAPI().catch(err => console.error(err));
                 return;
             }
 
@@ -260,32 +297,19 @@
             });
 
             pendingReportRequest = false;
-            if (wsReportTimeout) {
-                clearTimeout(wsReportTimeout);
-                wsReportTimeout = null;
-            }
-            lastReportData = {
-                type: 'monthly',
-                data: rows,
-                meta: {
-                    inv_names: invNames,
-                    source: 'websocket_daily_history'
-                }
-            };
+            if (wsReportTimeout) { clearTimeout(wsReportTimeout); wsReportTimeout = null; }
+            lastReportData = { type: 'monthly', data: rows, meta: { inv_names: invNames, source: 'websocket_daily_history' } };
             monthlyRun = null;
             renderReportData('monthly', rows, invNames);
         }
 
-        function advanceMonthlyRun(run) {
+        function advance(run) {
             if (!run || run.cancelled || monthlyRun !== run) return;
-            if (run.timer) {
-                clearTimeout(run.timer);
-                run.timer = null;
-            }
+            if (run.timer) { clearTimeout(run.timer); run.timer = null; }
 
             run.index++;
             if (run.index >= run.requestDates.length) {
-                renderMonthlyRun(run);
+                renderMonthly(run);
                 return;
             }
 
@@ -296,7 +320,7 @@
                 if (run.cancelled || monthlyRun !== run) return;
                 if (!ws || ws.readyState !== WebSocket.OPEN) {
                     connectReportWS();
-                    run.timer = setTimeout(send, 500);
+                    run.timer = setTimeout(send, 400);
                     return;
                 }
 
@@ -307,56 +331,44 @@
                     pageName: 'inverter&vcb-daily',
                     date: dateValue
                 }));
-                console.log('WS: monthly history requesting daily report', run.plant, dateValue);
+                console.log('Monthly history request:', run.plant, dateValue);
 
                 run.timer = setTimeout(async () => {
                     if (run.cancelled || monthlyRun !== run || run.currentDate !== dateValue) return;
                     const fallback = await fetchDailyAPIFallback(run, dateValue);
-                    storeMonthlyDay(run, fallback);
-                    advanceMonthlyRun(run);
-                }, 8000);
+                    storeDay(run, fallback);
+                    advance(run);
+                }, 7000);
             };
-
             send();
         }
 
-        window.handleWSReportResponse = function (d) {
+        window.handleWSReportResponse = function (message) {
             const typeEl = document.getElementById('reportType');
-
             if (!monthlyRun || !typeEl || typeEl.value !== 'monthly') {
-                return originalHandleWSReportResponse(d);
+                return originalHandleWSReportResponse(message);
             }
 
             const run = monthlyRun;
             if (run.cancelled || !run.currentDate) return;
 
-            const responseDate =
-                (d && (d.date || d.reportDate || d.report_date)) ||
-                (d && d.meta && (d.meta.date || d.meta.reportDate)) ||
-                '';
-
+            const responseDate = (message && (message.date || message.reportDate || message.report_date)) ||
+                (message && message.meta && (message.meta.date || message.meta.reportDate)) || '';
             if (responseDate) {
-                const normalizedResponseDate = String(responseDate).slice(0, 10);
-                if (/^\d{4}-\d{2}-\d{2}$/.test(normalizedResponseDate) &&
-                    normalizedResponseDate !== run.currentDate) {
-                    return;
-                }
+                const normalized = String(responseDate).slice(0, 10);
+                if (/^\d{4}-\d{2}-\d{2}$/.test(normalized) && normalized !== run.currentDate) return;
             }
 
-            const dayData = parseDailyWSReport(d, run.currentDate);
+            const dayData = parseDailyReport(message, run.currentDate);
             if (!dayData) return;
 
-            if (run.timer) {
-                clearTimeout(run.timer);
-                run.timer = null;
-            }
-            storeMonthlyDay(run, dayData);
-            advanceMonthlyRun(run);
+            if (run.timer) { clearTimeout(run.timer); run.timer = null; }
+            storeDay(run, dayData);
+            advance(run);
         };
 
         window.generateReportData = function () {
             const typeEl = document.getElementById('reportType');
-
             if (!typeEl || typeEl.value !== 'monthly') {
                 cancelMonthlyRun();
                 return originalGenerateReportData();
@@ -368,7 +380,6 @@
             const displayDate = document.getElementById('displayDate');
             const selectedMonth = monthEl ? monthEl.value : '';
             const plant = plantEl ? plantEl.value : '';
-
             if (!selectedMonth || !plant) return originalGenerateReportData();
 
             if (plant === 'all') {
@@ -386,71 +397,40 @@
             const year = monthStart.getFullYear();
             const monthIndex = monthStart.getMonth();
             const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
-
             const allDates = [];
             for (let day = 1; day <= daysInMonth; day++) {
-                allDates.push(
-                    year + '-' +
-                    String(monthIndex + 1).padStart(2, '0') + '-' +
-                    String(day).padStart(2, '0')
-                );
+                allDates.push(year + '-' + String(monthIndex + 1).padStart(2, '0') + '-' + String(day).padStart(2, '0'));
             }
 
             const now = new Date();
             let lastHistoryDay = daysInMonth;
-            if (year === now.getFullYear() && monthIndex === now.getMonth()) {
-                lastHistoryDay = now.getDate();
-            } else if (monthStart > new Date(now.getFullYear(), now.getMonth(), 1)) {
-                lastHistoryDay = 0;
-            }
-            const requestDates = allDates.slice(0, lastHistoryDay);
+            if (year === now.getFullYear() && monthIndex === now.getMonth()) lastHistoryDay = now.getDate();
+            else if (monthStart > new Date(now.getFullYear(), now.getMonth(), 1)) lastHistoryDay = 0;
 
-            if (displayDate) {
-                displayDate.innerText = monthStart.toLocaleDateString('en-IN', {
-                    year: 'numeric',
-                    month: 'long'
-                });
-            }
+            if (displayDate) displayDate.innerText = monthStart.toLocaleDateString('en-IN', { year: 'numeric', month: 'long' });
             if (tbody) {
-                tbody.innerHTML = '<tr><td colspan="30" class="py-12 bg-white">' +
-                    '<div class="flex flex-col items-center justify-center">' +
-                    '<div class="w-10 h-10 border-4 border-gray-200 border-t-blue-600 rounded-full animate-spin"></div>' +
-                    '<p class="mt-3 text-sm font-bold text-gray-600">Loading each day from SCADA history...</p>' +
-                    '</div></td></tr>';
-            }
-
-            if (!requestDates.length) {
-                pendingReportRequest = false;
-                fetchReportFromAPI().catch(console.error);
-                return;
+                tbody.innerHTML = '<tr><td colspan="30" class="py-12 bg-white"><div class="flex flex-col items-center justify-center"><div class="w-10 h-10 border-4 border-gray-200 border-t-blue-600 rounded-full animate-spin"></div><p class="mt-3 text-sm font-bold text-gray-600">Loading monthly SCADA history...</p></div></td></tr>';
             }
 
             monthlyRun = {
                 key: runKey,
                 plant,
-                selectedMonth,
                 allDates,
-                requestDates,
+                requestDates: allDates.slice(0, lastHistoryDay),
+                index: -1,
+                currentDate: '',
                 days: {},
                 invNames: new Set(),
                 successfulDays: 0,
-                index: -1,
-                currentDate: '',
                 timer: null,
                 cancelled: false
             };
-
             pendingReportRequest = true;
-            if (wsReportTimeout) {
-                clearTimeout(wsReportTimeout);
-                wsReportTimeout = null;
-            }
             connectReportWS();
-            advanceMonthlyRun(monthlyRun);
+            advance(monthlyRun);
         };
     }
 
-    installMonthlyReportsFix();
     document.addEventListener('DOMContentLoaded', function () {
         initializeSidebar();
         installMonthlyReportsFix();
