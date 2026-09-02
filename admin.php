@@ -145,7 +145,7 @@ if (!$adminUser || $adminUser['role'] !== 'admin') {
             plantState[p.id] = {
                 vcbPower: 0,
                 hasVCB: false,
-                hasVcbToday: false,
+                vcbToday: 0,
                 dailyEnergy: 0,
                 inverters: {},
                 peakInverterKw: 0,
@@ -218,7 +218,7 @@ if (!$adminUser || $adminUser['role'] !== 'admin') {
                         
                         <div class="p-4 grid grid-cols-2 gap-3 shrink-0">
                             <div class="bg-slate-50 rounded-lg p-3 border border-slate-100 flex flex-col justify-center">
-                                <div class="text-slate-400 text-[10px] font-bold uppercase mb-1 tracking-wider"><i class="fa-solid fa-bolt text-yellow-500 mr-1"></i><span id="active-label-${p.id}">Active</span></div>
+                                <div class="text-slate-400 text-[10px] font-bold uppercase mb-1 tracking-wider"><i class="fa-solid fa-bolt text-yellow-500 mr-1"></i><span id="active-label-${p.id}">VCB Active</span></div>
                                 <div class="text-sm font-black text-slate-800" id="active-${p.id}">0.00 kW</div>
                             </div>
                             <div class="bg-slate-50 rounded-lg p-3 border border-slate-100 flex flex-col justify-center">
@@ -261,7 +261,7 @@ if (!$adminUser || $adminUser['role'] !== 'admin') {
             }
 
             const finalActivePower = st.hasVCB ? st.vcbPower : sumInverterPower;
-            const activeLabel = st.hasVCB ? 'VCB Active' : 'Active';
+            const activeLabel = 'VCB Active';
 
             document.getElementById(`active-${unit_id}`).textContent = `${finalActivePower.toFixed(2)} kW`;
             const labelEl = document.getElementById(`active-label-${unit_id}`);
@@ -463,9 +463,7 @@ if (!$adminUser || $adminUser['role'] !== 'admin') {
                     }
 
                     if (data.virtualTags && data.virtualTags["vcb-today"] !== undefined) {
-                        const vcbToday = parseFloat(data.virtualTags["vcb-today"].value) || 0;
-                        plantState[unit].dailyEnergy = vcbToday;
-                        plantState[unit].hasVcbToday = vcbToday > 0;
+                        plantState[unit].vcbToday = parseFloat(data.virtualTags["vcb-today"].value) || 0;
                     }
 
                     if (data.values) {
@@ -517,26 +515,25 @@ if (!$adminUser || $adminUser['role'] !== 'admin') {
                                 }
                             }
                             const previousInv = plantState[unit].inverters[deviceName] || {};
-                            let vinobaDailyGen = previousInv.dailyGen || 0;
-                            if (unit === 'vinoba-velliyanai') {
-                                for (const key in data.values) {
-                                    const lower = key.toLowerCase();
-                                    if (/daily.*generation|daily.*gen/.test(lower)) {
-                                        vinobaDailyGen = parseFloat(data.values[key]) || 0;
-                                        break;
+                            let dailyGen = Number(previousInv.dailyGen) || 0;
+                            for (const key in data.values) {
+                                const lower = key.toLowerCase();
+                                if (/daily.*generation|daily.*gen|today.*generation|today.*gen/.test(lower)) {
+                                    const incomingDailyGen = parseFloat(data.values[key]);
+                                    if (Number.isFinite(incomingDailyGen) && (incomingDailyGen > 0 || dailyGen <= 0)) {
+                                        dailyGen = incomingDailyGen;
                                     }
+                                    break;
                                 }
                             }
                             plantState[unit].inverters[deviceName] = {
                                 active: activeStrCount,
                                 total: totalStrCount,
                                 power: pwr,
-                                ...(unit === 'vinoba-velliyanai' ? { dailyGen: vinobaDailyGen } : {})
+                                dailyGen: dailyGen
                             };
-                            if (unit === 'vinoba-velliyanai' && !plantState[unit].hasVcbToday) {
-                                plantState[unit].dailyEnergy = Object.values(plantState[unit].inverters)
-                                    .reduce((sum, inverter) => sum + (Number(inverter.dailyGen) || 0), 0);
-                            }
+                            plantState[unit].dailyEnergy = Object.values(plantState[unit].inverters)
+                                .reduce((sum, inverter) => sum + (Number(inverter.dailyGen) || 0), 0);
                             const liveCombinedPower = Object.values(plantState[unit].inverters)
                                 .reduce((sum, inverter) => sum + (inverter.power || 0), 0);
                             plantState[unit].liveCombinedKw = liveCombinedPower;
