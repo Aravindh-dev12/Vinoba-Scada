@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plant Data Test - WebSocket</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
+        h1 { text-align: center; color: #38bdf8; margin-bottom: 20px; }
+        .status-bar { text-align: center; padding: 10px; margin-bottom: 20px; border-radius: 8px; font-weight: bold; }
+        .status-connected { background: #064e3b; color: #34d399; }
+        .status-disconnected { background: #7f1d1d; color: #f87171; }
+        .status-connecting { background: #78350f; color: #fbbf24; }
+        .plants-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+        .plant-card { background: #1e293b; border-radius: 12px; padding: 16px; border: 1px solid #334155; }
+        .plant-card h2 { font-size: 16px; margin: 0 0 12px 0; padding-bottom: 8px; border-bottom: 2px solid #334155; }
+        .plant-vinoba h2 { color: #a78bfa; border-color: #7c3aed; }
+        .plant-makkal h2 { color: #38bdf8; border-color: #0284c7; }
+        .plant-anushyam h2 { color: #34d399; border-color: #059669; }
+        .data-section { margin-bottom: 12px; }
+        .data-section h3 { font-size: 12px; color: #94a3b8; text-transform: uppercase; margin: 0 0 6px 0; }
+        .data-row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; border-bottom: 1px solid #334155; }
+        .data-row .key { color: #cbd5e1; }
+        .data-row .val { color: #f1f5f9; font-weight: bold; font-family: monospace; }
+        .msg-count { font-size: 11px; color: #64748b; margin-top: 8px; }
+        .raw-log { background: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 8px; font-size: 11px; font-family: monospace; max-height: 200px; overflow-y: auto; margin-top: 8px; white-space: pre-wrap; word-break: break-all; }
+        .indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+        .indicator-live { background: #34d399; animation: pulse 1.5s infinite; }
+        .indicator-dead { background: #ef4444; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+    </style>
+</head>
+<body>
+    <h1>WebSocket Plant Data Test</h1>
+    <div id="statusBar" class="status-bar status-disconnected">Disconnected</div>
+    <div class="plants-grid">
+        <div class="plant-card plant-vinoba">
+            <h2><span id="ind-vinoba-velliyanai" class="indicator indicator-dead"></span>Vinoba Velliyanai</h2>
+            <div class="data-section">
+                <h3>VCB Power</h3>
+                <div class="data-row"><span class="key">3 Phase Active Power</span><span class="val" id="vcb-vinoba-velliyanai">--</span></div>
+                <div class="data-row"><span class="key">VCB Today (kWh)</span><span class="val" id="energy-vinoba-velliyanai">--</span></div>
+            </div>
+            <div class="data-section">
+                <h3>Inverters</h3>
+                <div id="inv-vinoba-velliyanai" style="font-size:12px;color:#94a3b8;">Waiting...</div>
+            </div>
+            <div class="msg-count">Messages: <span id="count-vinoba-velliyanai">0</span></div>
+            <div class="raw-log" id="log-vinoba-velliyanai"></div>
+        </div>
+        <div class="plant-card plant-makkal">
+            <h2><span id="ind-makkalpower" class="indicator indicator-dead"></span>Makkal Power</h2>
+            <div class="data-section">
+                <h3>VCB Power</h3>
+                <div class="data-row"><span class="key">3 Phase Active Power</span><span class="val" id="vcb-makkalpower">--</span></div>
+                <div class="data-row"><span class="key">VCB Today (kWh)</span><span class="val" id="energy-makkalpower">--</span></div>
+            </div>
+            <div class="data-section">
+                <h3>Inverters</h3>
+                <div id="inv-makkalpower" style="font-size:12px;color:#94a3b8;">Waiting...</div>
+            </div>
+            <div class="msg-count">Messages: <span id="count-makkalpower">0</span></div>
+            <div class="raw-log" id="log-makkalpower"></div>
+        </div>
+        <div class="plant-card plant-anushyam">
+            <h2><span id="ind-anushyam" class="indicator indicator-dead"></span>Anushyam</h2>
+            <div class="data-section">
+                <h3>VCB Power</h3>
+                <div class="data-row"><span class="key">3 Phase Active Power</span><span class="val" id="vcb-anushyam">--</span></div>
+                <div class="data-row"><span class="key">VCB Today (kWh)</span><span class="val" id="energy-anushyam">--</span></div>
+            </div>
+            <div class="data-section">
+                <h3>Inverters</h3>
+                <div id="inv-anushyam" style="font-size:12px;color:#94a3b8;">Waiting...</div>
+            </div>
+            <div class="msg-count">Messages: <span id="count-anushyam">0</span></div>
+            <div class="raw-log" id="log-anushyam"></div>
+        </div>
+    </div>
+    <script>
+        const plants = ['vinoba-velliyanai', 'makkalpower', 'anushyam'];
+        const msgCounts = {};
+        const plantInverters = {};
+        plants.forEach(p => { msgCounts[p] = 0; plantInverters[p] = {}; });
+        function logRaw(plant, text) {
+            const el = document.getElementById('log-' + plant);
+            const ts = new Date().toLocaleTimeString();
+            el.textContent = '[' + ts + '] ' + text + '\n' + el.textContent.split('\n').slice(0, 5).join('\n');
+        }
+        function setVal(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
+        function handleData(data) {
+            const unit = data.unit_id;
+            if (!plants.includes(unit)) return;
+            msgCounts[unit]++;
+            setVal('count-' + unit, msgCounts[unit]);
+            document.getElementById('ind-' + unit).className = 'indicator indicator-live';
+            if (data.values && data.values['3 Phase Active Power'] !== undefined) {
+                setVal('vcb-' + unit, parseFloat(data.values['3 Phase Active Power']).toFixed(2) + ' kW');
+            }
+            if (data.virtualTags && data.virtualTags['vcb-today'] !== undefined) {
+                setVal('energy-' + unit, parseFloat(data.virtualTags['vcb-today'].value).toFixed(2) + ' kWh');
+            }
+            if (data.values) {
+                const taskStr = data.task ? data.task.toString().toLowerCase() : '';
+                const deviceStr = data.device ? data.device.toString().toLowerCase() : '';
+                if (taskStr === 'vcb' || deviceStr.includes('vcb')) return;
+                const keys = Object.keys(data.values);
+                const hasInvPower = keys.some(pk => { const pkl = pk.toLowerCase(); return (/power/.test(pkl) && /active|ac/.test(pkl) && !/reactive|apparent/.test(pkl)); });
+                const hasNumberedCurrents = keys.some(k => /\d/.test(k) && /curr|current|amp/i.test(k) && !/phase|3.phase|reactive|apparent|freq|temp/i.test(k.toLowerCase()));
+                const isInv = (taskStr === 'inverter') || hasInvPower || hasNumberedCurrents;
+                if (isInv) {
+                    const devName = data.device || 'Unknown';
+                    let pwr = 0;
+                    for (const pk in data.values) { const pkl = pk.toLowerCase(); if (/active.*power|ac.*power|power.*ac|a\.c\..*power/i.test(pkl) && !/reactive|apparent|3.phase/i.test(pkl)) { pwr = parseFloat(data.values[pk]) || 0; break; } }
+                    let activeStr = 0, totalStr = 0;
+                    for (const k of keys) { const kl = k.toLowerCase(); if (/phase|phasa|ph_|r.phase|y.phase|b.phase|a.phase|c.phase|3.phase|three.phase/i.test(kl)) continue; if (/inverter.*curr|inv.*curr|total.*curr|grid.*curr|load.*curr|reactive.*curr|mppt.*curr|dc.*curr/i.test(kl)) continue; if (/freq|temperature|temp|ambient|cosphi|pf.*_/i.test(kl)) continue; if (/\b(curr|current|amp|i)\b/i.test(kl) && !/\b(volt|voltage|temp|freq)\b/i.test(kl) && /\d/.test(k)) { totalStr++; if (parseFloat(data.values[k]) > 0.5) activeStr++; } }
+                    plantInverters[unit][devName] = { power: pwr, active: activeStr, total: totalStr };
+                    let invHtml = '';
+                    Object.keys(plantInverters[unit]).sort().forEach(name => { const inv = plantInverters[unit][name]; invHtml += '<div class="data-row"><span class="key">' + name + '</span><span class="val">' + inv.power.toFixed(1) + ' kW (' + inv.active + '/' + inv.total + ')</span></div>'; });
+                    document.getElementById('inv-' + unit).innerHTML = invHtml || 'Waiting...';
+                }
+            }
+            const summary = 'unit=' + data.unit_id + ' device=' + (data.device || '?') + ' task=' + (data.task || '?') + ' keys=' + (data.values ? Object.keys(data.values).slice(0,5).join(',') : 'none');
+            logRaw(unit, summary);
+        }
+        function connectWS() {
+            const statusBar = document.getElementById('statusBar');
+            statusBar.className = 'status-bar status-connecting';
+            statusBar.textContent = 'Connecting to wss://vinobasolar.scadahub.in:5001 ...';
+            const ws = new WebSocket('wss://vinobasolar.scadahub.in:5001');
+            ws.onopen = function() {
+                statusBar.className = 'status-bar status-connected';
+                statusBar.textContent = 'Connected - Subscribed to all 3 plants';
+                plants.forEach(p => { ws.send(JSON.stringify({ type: 'subscribe', unit_id: p })); });
+            };
+            ws.onmessage = function(e) {
+                try { const d = JSON.parse(e.data); if (d.type === 'device_list' || d.type === 'daily_data_result') { logRaw('vinoba-velliyanai', '[SYSTEM] ' + d.type + ' received'); return; } handleData(d); } catch(err) { console.error('Parse error:', err); }
+            };
+            ws.onclose = function() {
+                statusBar.className = 'status-bar status-disconnected';
+                statusBar.textContent = 'Disconnected - Reconnecting in 5s...';
+                plants.forEach(p => { document.getElementById('ind-' + p).className = 'indicator indicator-dead'; });
+                setTimeout(connectWS, 5000);
+            };
+            ws.onerror = function() { console.error('WS error'); };
+        }
+        connectWS();
+    </script>
+</body>
+</html>

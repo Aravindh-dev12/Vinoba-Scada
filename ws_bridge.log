@@ -1,0 +1,24 @@
+[MAIN] Time-limited mode: will run for 240s then exit
+[WS] Connected to 161.97.87.75:5000
+[WS] Subscribed to vinoba-velliyanai
+[WS] Subscribed to makkalpower
+[WS] Subscribed to anushyam
+[DB] VCB inserted for makkalpower
+[DB] Telemetry vcb_power for makkalpower inserted (hourly)
+[DB] VCB inserted for anushyam
+[DB] Telemetry vcb_power for anushyam inserted (hourly)
+[DB] Transformer Transformer-winding inserted for vinoba-velliyanai
+[DB] Telemetry winding_temp for vinoba-velliyanai inserted (hourly)
+PHP Fatal error:  Uncaught ArgumentCountError: The number of elements in the type definition string must match the number of bind variables in /var/www/vinobasolar.scadahub.in/ws_bridge.php:283
+Stack trace:
+#0 /var/www/vinobasolar.scadahub.in/ws_bridge.php(283): mysqli_stmt->bind_param()
+#1 /var/www/vinobasolar.scadahub.in/ws_bridge.php(464): insertInverter()
+#2 {main}
+  thrown in /var/www/vinobasolar.scadahub.in/ws_bridge.php on line 283
+
+Fatal error: Uncaught ArgumentCountError: The number of elements in the type definition string must match the number of bind variables in /var/www/vinobasolar.scadahub.in/ws_bridge.php:283
+Stack trace:
+#0 /var/www/vinobasolar.scadahub.in/ws_bridge.php(283): mysqli_stmt->bind_param()
+#1 /var/www/vinobasolar.scadahub.in/ws_bridge.php(464): insertInverter()
+#2 {main}
+  thrown in /var/www/vinobasolar.scadahub.in/ws_bridge.php on line 283
